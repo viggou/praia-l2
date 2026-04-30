@@ -1,0 +1,6 @@
+grains:
+  arp:
+    source: github.com/viggou/praia-arp
+    version: latest
+    url: https://github.com/viggou/praia-arp.git
+    installed: 2026-04-30

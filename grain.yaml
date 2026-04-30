@@ -1,0 +1,8 @@
+name: l2
+version: 1.0.0
+description: Layer 2 raw ethernet frame access (AF_PACKET/BPF)
+author: Viggo Lekdorf
+license: MIT
+main: main.praia
+dependencies:
+  arp: github.com/viggou/praia-arp

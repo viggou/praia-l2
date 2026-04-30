@@ -1,0 +1,134 @@
+// l2 — Layer 2 raw ethernet frame access for Praia
+//
+// Provides raw socket access at the ethernet level (AF_PACKET on Linux,
+// BPF on macOS) plus helpers for building and parsing ethernet/ARP frames.
+// Requires root or CAP_NET_RAW.
+//
+// Usage:
+//   use "l2"
+//
+//   let sock = l2.open("en0")
+//   l2.setTimeout(sock, 2000)
+//
+//   // Send a gratuitous ARP
+//   let myMac = l2.mac("en0")
+//   let frame = l2.ethFrame("ff:ff:ff:ff:ff:ff", myMac, 0x0806,
+//       l2.arpPacket(2, myMac, "10.0.0.1", "ff:ff:ff:ff:ff:ff", "10.0.0.1"))
+//   l2.send(sock, frame)
+//
+//   // Sniff frames
+//   let data = l2.recv(sock)
+//   let parsed = l2.parseFrame(data)
+//   print(parsed.src, "->", parsed.dst, "type:", parsed.etherType)
+//
+//   l2.close(sock)
+
+use "arp"
+use "hex"
+
+let ext = ".dylib"
+if (sys.platform != "darwin") {
+    let arch = sys.exec(["uname", "-m"]).stdout.strip()
+    ext = "-linux-" + arch + ".so"
+}
+
+let _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/l2" + ext)
+
+// ── Native functions ──
+
+let open = _native.open
+let send = _native.send
+let recv = _native.recv
+let close = _native.close
+let mac = _native.mac
+let setTimeout = _native.setTimeout
+
+// ── Helpers ──
+
+func formatMac(arr) {
+    return map(arr, lam{ hex.fromInt(it, 2) }).join(":")
+}
+
+func macToBytes(mac) {
+    return hex.decode(mac.replace(":", ""))
+}
+
+func ipToBytes(ip) {
+    return bytes.from(ip.split(".") |> map(lam{ num(it) }))
+}
+
+// ── Frame building ──
+
+// Build a raw ethernet frame.
+// dst/src: MAC strings ("aa:bb:cc:dd:ee:ff")
+// etherType: int (0x0806 = ARP, 0x0800 = IPv4)
+// payload: bytes
+func ethFrame(dst, src, etherType, payload) {
+    let header = macToBytes(dst) + macToBytes(src) +
+        bytes.from([(etherType >> 8) & 0xFF, etherType & 0xFF])
+    return header + payload
+}
+
+// Build an ARP packet (28 bytes, no ethernet header).
+// op: 1 = request, 2 = reply
+// senderMac/targetMac: MAC strings
+// senderIp/targetIp: IP strings
+func arpPacket(op, senderMac, senderIp, targetMac, targetIp) {
+    let header = bytes.from([
+        0x00, 0x01,                     // Hardware type: Ethernet
+        0x08, 0x00,                     // Protocol type: IPv4
+        0x06,                           // Hardware size: 6
+        0x04,                           // Protocol size: 4
+        (op >> 8) & 0xFF, op & 0xFF     // Opcode
+    ])
+    return header +
+        macToBytes(senderMac) + ipToBytes(senderIp) +
+        macToBytes(targetMac) + ipToBytes(targetIp)
+}
+
+// ── Frame parsing ──
+
+// Parse a raw ethernet frame into {dst, src, etherType, payload}
+func parseFrame(data) {
+    if (!data) { return nil }
+    let raw = bytes.toArray(data)
+    if (len(raw) < 14) { return nil }
+    return {
+        dst: formatMac(raw.slice(0, 6)),
+        src: formatMac(raw.slice(6, 12)),
+        etherType: raw[12] * 256 + raw[13],
+        payload: bytes.from(raw.slice(14))
+    }
+}
+
+// Parse an ARP payload (from parseFrame().payload) into
+// {op, senderMac, senderIp, targetMac, targetIp}
+func parseArp(data) {
+    if (!data) { return nil }
+    let raw = bytes.toArray(data)
+    if (len(raw) < 28) { return nil }
+    return {
+        op: raw[6] * 256 + raw[7],
+        senderMac: formatMac(raw.slice(8, 14)),
+        senderIp: map(raw.slice(14, 18), lam{ str(it) }).join("."),
+        targetMac: formatMac(raw.slice(18, 24)),
+        targetIp: map(raw.slice(24, 28), lam{ str(it) }).join(".")
+    }
+}
+
+// ── ARP convenience (uses arp grain) ──
+
+// Resolve a MAC address for an IP, pinging first to populate the ARP cache.
+func resolve(ip) {
+    let entry = arp.refresh(ip)
+    if (entry) { return entry.mac }
+    return nil
+}
+
+export {
+    open, send, recv, close, mac, setTimeout,
+    ethFrame, arpPacket,
+    parseFrame, parseArp,
+    macToBytes, ipToBytes, formatMac,
+    resolve
+}
