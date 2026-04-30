@@ -11,6 +11,7 @@
 #include <vector>
 
 #ifdef __linux__
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
