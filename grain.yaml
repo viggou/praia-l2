@@ -1,5 +1,5 @@
 name: l2
-version: 1.0.0
+version: 1.0.1
 description: Layer 2 raw ethernet frame access (AF_PACKET/BPF)
 author: Viggo Lekdorf
 license: MIT
