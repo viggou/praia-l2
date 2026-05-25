@@ -10,6 +10,10 @@
 #include <unordered_map>
 #include <vector>
 
+PRAIA_DECLARE_ABI();
+PRAIA_PLUGIN_METADATA("l2", "0.2.0",
+                     "Raw L2 (Ethernet) socket access");
+
 #ifdef __linux__
 #include <arpa/inet.h>
 #include <sys/socket.h>
@@ -41,6 +45,17 @@ struct L2Socket {
 
 static std::unordered_map<int64_t, L2Socket> sockets;
 static int64_t nextId = 1;
+
+// Process-exit hook — close any sockets still in the map so we don't
+// leak raw socket fds on script crashes or sys.exit(). Runs on the
+// engine thread after all async tasks have completed (per the
+// PluginExitGuard ordering), so no concurrent map access.
+extern "C" void praia_at_exit(void) {
+    for (auto& [id, sock] : sockets) {
+        if (sock.fd >= 0) ::close(sock.fd);
+    }
+    sockets.clear();
+}
 
 static bool getIfaceMac(const std::string& ifName, uint8_t* mac) {
 #ifdef __linux__
