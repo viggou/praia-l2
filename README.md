@@ -42,11 +42,11 @@ l2.close(sock)
 
 | Function | Description |
 |----------|-------------|
-| `open(iface)` | Open a raw L2 socket bound to an interface |
-| `send(sock, data)` | Send a raw ethernet frame (min 14 bytes) |
-| `recv(sock)` | Receive a raw ethernet frame, returns nil on timeout |
-| `close(sock)` | Close the socket |
-| `setTimeout(sock, ms)` | Set receive timeout in milliseconds |
+| `open(iface)` | Open a raw L2 socket bound to an interface. Returns a socket handle, closed automatically once it's no longer used |
+| `send(sock, data)` | Send a raw ethernet frame (14 to 65535 bytes) |
+| `recv(sock, maxBytes?)` | Receive a raw ethernet frame (up to `maxBytes`, 1-65536, default 65536). Returns nil on timeout, or when cancelled with `withCancel`. Ctrl+C throws |
+| `close(sock)` | Close the socket. A `recv` waiting in another task returns nil. Closing twice is fine |
+| `setTimeout(sock, ms)` | How long `recv` waits, in milliseconds; 0 (the default) waits until a frame arrives |
 | `mac(iface)` | Get the MAC address of a local interface |
 
 ### Frame building
@@ -83,4 +83,6 @@ Requires Praia's development headers (`praia --include-path`).
 ## Platform notes
 
 - **Linux**: Uses `AF_PACKET` with `SOCK_RAW`. Requires root or `CAP_NET_RAW`.
-- **macOS**: Uses BPF (`/dev/bpfN`). Requires root. BPF reads may return multiple packets per buffer read - currently only the first packet is extracted per `recv()` call. Call `recv()` in a loop for continuous capture.
+- **macOS**: Uses BPF (`/dev/bpfN`). Requires root (or access to the BPF devices). One BPF read can hold several frames; `recv()` returns them one per call.
+
+Async tasks can share a socket: a `send` doesn't wait for a `recv` in progress, and `close` from one task ends a `recv` waiting in another.

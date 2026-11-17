@@ -49,12 +49,28 @@ func formatMac(arr) {
     return map(arr, lam{ hex.fromInt(it, 2) }).join(":")
 }
 
+// "aa:bb:cc:dd:ee:ff" to 6 bytes. Octets may drop a leading zero, as
+// macOS's arp prints them ("0:1c:42:a:b:c")
 func macToBytes(mac) {
-    return hex.decode(mac.replace(":", ""))
+    let parts = mac.split(":")
+    if (len(parts) != 6) { throw "l2: invalid MAC address: " + mac }
+    let padded = map(parts, lam{ p in
+        if (len(p) < 1 || len(p) > 2) { throw "l2: invalid MAC address: " + mac }
+        return len(p) == 1 ? "0" + p : p
+    })
+    return hex.decode(padded.join(""))
 }
 
 func ipToBytes(ip) {
-    return bytes.from(ip.split(".") |> map(lam{ num(it) }))
+    let parts = ip.split(".")
+    if (len(parts) != 4) { throw "l2: invalid IPv4 address: " + ip }
+    return bytes.from(map(parts, lam{ p in
+        let n = nil
+        try { n = int(p) } catch (e) { throw "l2: invalid IPv4 address: " + ip }
+        // int() also takes "1.5" and " 7"; an octet is exactly its digits
+        if (n < 0 || n > 255 || str(n) != p) { throw "l2: invalid IPv4 address: " + ip }
+        return n
+    }))
 }
 
 // ── Frame building ──

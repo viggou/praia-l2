@@ -16,7 +16,8 @@ endif
 all:
 	g++ -std=c++17 -shared -fPIC $(EXTRA_FLAGS) -I$(PRAIA_INCLUDE) $(LDFLAGS) -o $(OUT) plugins/l2.cpp
 
+# Only this platform's build: the other prebuilt plugins are committed
 clean:
-	rm -f plugins/l2.dylib plugins/l2-linux-*.so
+	rm -f $(OUT)
 
 .PHONY: all clean

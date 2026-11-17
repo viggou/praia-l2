@@ -4,14 +4,20 @@
 #define _XOPEN_SOURCE 700
 
 #include "praia_plugin.h"
+#include "signal_state.h"
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstring>
-#include <unordered_map>
+#include <mutex>
+#include <poll.h>
+#include <unordered_set>
 #include <vector>
 
 PRAIA_DECLARE_ABI();
-PRAIA_PLUGIN_METADATA("l2", "0.2.0",
+PRAIA_PLUGIN_METADATA("l2", "1.1.1",
                      "Raw L2 (Ethernet) socket access");
 
 #ifdef __linux__
@@ -36,30 +42,126 @@ PRAIA_PLUGIN_METADATA("l2", "0.2.0",
 #include <ifaddrs.h>
 #endif
 
+// A raw socket handle. Async tasks can share one, so:
+//   recvMu serializes receives (held through a waiting recv()),
+//   sendMu serializes sends, so a send isn't stuck behind a recv,
+//   closing is set first thing in close(): a waiting recv() sees it
+//   within one poll slice and returns, and no new call starts.
+// close() then takes both locks before closing the fd, so neither side
+// ever uses a closed (or reused) descriptor.
 struct L2Socket {
+    std::timed_mutex recvMu;
+    std::timed_mutex sendMu;
+    std::atomic<bool> closing{false};
     int fd = -1;
     int ifIndex = 0;
-    int bpfBufLen = 4096;
+    // How long recv() waits; 0: until a frame arrives. Atomic, so
+    // setTimeout() doesn't wait for a recv() in progress
+    std::atomic<int> timeoutMs{0};
     std::string ifName;
+    // macOS: one BPF read can hold several frames; recv() hands them out
+    // one at a time from here
+    std::vector<uint8_t> bpfBuf;
+    size_t bpfOff = 0, bpfLen = 0;
 };
+static const char* kSocketType = "l2.socket";
 
-static std::unordered_map<int64_t, L2Socket> sockets;
-static int64_t nextId = 1;
+// Live sockets, for the exit hook. Leaked on purpose: deleters can run
+// during process teardown, after statics are destroyed
+static std::mutex g_regMu;
+static auto* g_sockets = new std::unordered_set<L2Socket*>();
 
-// Process-exit hook — close any sockets still in the map so we don't
-// leak raw socket fds on script crashes or sys.exit(). Runs on the
-// engine thread after all async tasks have completed (per the
-// PluginExitGuard ordering), so no concurrent map access.
-extern "C" void praia_at_exit(void) {
-    for (auto& [id, sock] : sockets) {
-        if (sock.fd >= 0) ::close(sock.fd);
-    }
-    sockets.clear();
+// Closes the fd. Call with both locks held
+static void closeFd(L2Socket* s) {
+    if (s->fd >= 0) ::close(s->fd);
+    s->fd = -1;
 }
+
+// The handle's deleter. Nothing else can be using it (whoever did held a
+// reference), so the locks are uncontended
+static void freeSocket(L2Socket* s) {
+    {
+        std::lock_guard<std::mutex> reg(g_regMu);
+        g_sockets->erase(s);
+    }
+    {
+        std::lock_guard<std::timed_mutex> r(s->recvMu);
+        std::lock_guard<std::timed_mutex> w(s->sendMu);
+        closeFd(s);
+    }
+    delete s;
+}
+
+// Process-exit hook — close any raw sockets still open on script crashes
+// or sys.exit(). An unawaited task may still be in recv(); it returns
+// within one poll slice of seeing closing, so the wait here is short
+extern "C" void praia_at_exit(void) {
+    std::lock_guard<std::mutex> reg(g_regMu);
+    for (auto* s : *g_sockets) {
+        s->closing = true;
+        std::unique_lock<std::timed_mutex> r(s->recvMu, std::chrono::milliseconds(250));
+        std::unique_lock<std::timed_mutex> w(s->sendMu, std::chrono::milliseconds(250));
+        if (r.owns_lock() && w.owns_lock()) closeFd(s);
+    }
+}
+
+// ── Helpers ──
+
+[[noreturn]] static void sysError(const std::string& what) {
+    praia::error(what + ": " + std::strerror(errno));
+}
+
+static L2Socket* argSocket(const std::vector<Value>& args, size_t i, const std::string& fn) {
+    if (i >= args.size() || !args[i].isExternal())
+        praia::error(fn + "() argument " + std::to_string(i + 1) + " must be an l2 socket");
+    return praia::getExternal<L2Socket>(args[i], kSocketType);
+}
+
+static bool interrupted() {
+    return g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT);
+}
+
+static bool cancelled() {
+    auto c = praia::shouldCancel();
+    return c && *c;
+}
+
+// Takes `lock` in short waits, giving up (false) if the call is cancelled
+// or the socket closes meanwhile. Ctrl+C throws
+static bool acquire(std::unique_lock<std::timed_mutex>& lock, L2Socket* s,
+                    const std::string& fn) {
+    while (true) {
+        if (interrupted()) praia::error("Interrupted");
+        if (s->closing) praia::error(fn + "(): the socket is closed");
+        if (cancelled()) return false;
+        if (lock.owns_lock()) return true;
+        if (lock.try_lock_for(std::chrono::milliseconds(50)))
+            continue;   // held: check once more
+    }
+}
+
+#ifdef __APPLE__
+// The next frame left in the BPF buffer, or false if none is
+static bool nextBpfFrame(L2Socket* s, std::string& frame) {
+    while (s->bpfOff < s->bpfLen) {
+        size_t left = s->bpfLen - s->bpfOff;
+        if (left < sizeof(struct bpf_hdr)) break;
+        auto* hdr = reinterpret_cast<const struct bpf_hdr*>(s->bpfBuf.data() + s->bpfOff);
+        size_t total = static_cast<size_t>(hdr->bh_hdrlen) + hdr->bh_caplen;
+        if (hdr->bh_hdrlen < sizeof(struct bpf_hdr) || total > left) break;
+        frame.assign(reinterpret_cast<const char*>(s->bpfBuf.data() + s->bpfOff + hdr->bh_hdrlen),
+                     hdr->bh_caplen);
+        s->bpfOff += BPF_WORDALIGN(total);
+        return true;
+    }
+    s->bpfOff = s->bpfLen = 0;
+    return false;
+}
+#endif
 
 static bool getIfaceMac(const std::string& ifName, uint8_t* mac) {
 #ifdef __linux__
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return false;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
@@ -94,167 +196,201 @@ extern "C" void praia_register(PraiaMap* module) {
     // l2.open(interface) -> handle
     module->entries["open"] = Value(makeNative("l2.open", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isString())
-                throw RuntimeError("l2.open() requires interface name", 0);
-
-            const auto& ifName = args[0].asString();
-            L2Socket sock;
-            sock.ifName = ifName;
+            const std::string fn = "l2.open";
+            const auto& ifName = praia::requireString(args, 0, fn);
+            if (ifName.empty() || ifName.size() >= IFNAMSIZ)
+                praia::error(fn + "(): invalid interface name: " + ifName);
+            int fd = -1;
+            int ifIndex = 0;
+            std::vector<uint8_t> bpfBuf;
 
 #ifdef __linux__
-            sock.fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-            if (sock.fd < 0)
-                throw RuntimeError("l2.open(): failed to create socket (need root?)", 0);
+            fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+            if (fd < 0)
+                sysError(fn + "(): can't create a raw socket (need root or CAP_NET_RAW?)");
 
-            sock.ifIndex = if_nametoindex(ifName.c_str());
-            if (sock.ifIndex == 0) {
-                close(sock.fd);
-                throw RuntimeError("l2.open(): unknown interface: " + ifName, 0);
+            ifIndex = static_cast<int>(if_nametoindex(ifName.c_str()));
+            if (ifIndex == 0) {
+                // It needs a socket itself, so it can also fail for want
+                // of a file descriptor; only ENXIO/ENODEV mean "no such"
+                int err = errno;
+                ::close(fd);
+                if (err == ENXIO || err == ENODEV)
+                    praia::error(fn + "(): unknown interface: " + ifName);
+                errno = err;
+                sysError(fn + "(): can't look up interface " + ifName);
             }
 
             struct sockaddr_ll sll;
             memset(&sll, 0, sizeof(sll));
             sll.sll_family = AF_PACKET;
-            sll.sll_ifindex = sock.ifIndex;
+            sll.sll_ifindex = ifIndex;
             sll.sll_protocol = htons(ETH_P_ALL);
-
-            if (bind(sock.fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
-                close(sock.fd);
-                throw RuntimeError("l2.open(): bind failed", 0);
+            if (bind(fd, (struct sockaddr*)&sll, sizeof(sll)) < 0) {
+                int err = errno;
+                ::close(fd);
+                errno = err;
+                sysError(fn + "(): bind to " + ifName + " failed");
             }
 #elif defined(__APPLE__)
-            sock.fd = -1;
-            for (int i = 0; i < 256; i++) {
+            for (int i = 0; i < 256 && fd < 0; i++) {
                 std::string dev = "/dev/bpf" + std::to_string(i);
-                sock.fd = ::open(dev.c_str(), O_RDWR);
-                if (sock.fd >= 0) break;
+                fd = ::open(dev.c_str(), O_RDWR | O_CLOEXEC);
+                if (fd < 0 && errno != EBUSY) break;   // EBUSY: try the next one
             }
-            if (sock.fd < 0)
-                throw RuntimeError("l2.open(): no available BPF device (need root?)", 0);
+            if (fd < 0)
+                sysError(fn + "(): no BPF device available (need root?)");
 
+            auto fail = [&](const std::string& what) {
+                int err = errno;
+                ::close(fd);
+                errno = err;
+                sysError(fn + "(): " + what);
+            };
             struct ifreq ifr;
             memset(&ifr, 0, sizeof(ifr));
             strncpy(ifr.ifr_name, ifName.c_str(), IFNAMSIZ - 1);
-            if (ioctl(sock.fd, BIOCSETIF, &ifr) < 0) {
-                close(sock.fd);
-                throw RuntimeError("l2.open(): failed to bind to " + ifName, 0);
-            }
-
-            ioctl(sock.fd, BIOCGBLEN, &sock.bpfBufLen);
-
-            int val = 1;
-            ioctl(sock.fd, BIOCIMMEDIATE, &val);
-            ioctl(sock.fd, BIOCSHDRCMPLT, &val);
+            if (ioctl(fd, BIOCSETIF, &ifr) < 0) fail("can't bind to " + ifName);
+            u_int bufLen = 0;
+            if (ioctl(fd, BIOCGBLEN, &bufLen) < 0 || bufLen == 0) fail("BIOCGBLEN");
+            u_int one = 1;
+            // Frames are readable as they arrive, not once the buffer fills
+            if (ioctl(fd, BIOCIMMEDIATE, &one) < 0) fail("BIOCIMMEDIATE");
+            // Send source MACs as given instead of the interface's
+            if (ioctl(fd, BIOCSHDRCMPLT, &one) < 0) fail("BIOCSHDRCMPLT");
+            bpfBuf.resize(bufLen);
 #endif
 
-            int64_t id = nextId++;
-            sockets[id] = std::move(sock);
-            return Value(id);
+            auto* s = new L2Socket();
+            s->fd = fd;
+            s->ifIndex = ifIndex;
+            s->ifName = ifName;
+            s->bpfBuf = std::move(bpfBuf);
+            {
+                std::lock_guard<std::mutex> reg(g_regMu);
+                g_sockets->insert(s);
+            }
+            return praia::makeExternal<L2Socket>(s, kSocketType, freeSocket);
         }));
 
     // l2.send(handle, frameData) -> bytes sent
     module->entries["send"] = Value(makeNative("l2.send", 2,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("l2.send() requires socket handle", 0);
-            if (!args[1].isString())
-                throw RuntimeError("l2.send() requires frame data", 0);
-
-            auto it = sockets.find(args[0].asInt());
-            if (it == sockets.end())
-                throw RuntimeError("l2.send(): invalid handle", 0);
-
-            auto& sock = it->second;
-            const auto& data = args[1].asString();
-
+            const std::string fn = "l2.send";
+            auto* s = argSocket(args, 0, fn);
+            const auto& data = praia::requireString(args, 1, fn);
             if (data.size() < 14)
-                throw RuntimeError("l2.send(): frame too small (need at least 14 bytes)", 0);
+                praia::error(fn + "(): frame too small (need at least 14 bytes)");
+            if (data.size() > 65535)
+                praia::error(fn + "(): frame too large");
 
+            std::unique_lock<std::timed_mutex> w(s->sendMu, std::defer_lock);
+            if (!acquire(w, s, fn)) return Value();
 #ifdef __linux__
             struct sockaddr_ll sll;
             memset(&sll, 0, sizeof(sll));
             sll.sll_family = AF_PACKET;
-            sll.sll_ifindex = sock.ifIndex;
+            sll.sll_ifindex = s->ifIndex;
             sll.sll_halen = 6;
-            if (data.size() >= 6)
-                memcpy(sll.sll_addr, data.data(), 6);
-
-            ssize_t sent = sendto(sock.fd, data.data(), data.size(), 0,
+            memcpy(sll.sll_addr, data.data(), 6);
+            ssize_t sent = sendto(s->fd, data.data(), data.size(), 0,
                                   (struct sockaddr*)&sll, sizeof(sll));
 #elif defined(__APPLE__)
-            ssize_t sent = write(sock.fd, data.data(), data.size());
+            ssize_t sent = write(s->fd, data.data(), data.size());
 #endif
-            if (sent < 0)
-                throw RuntimeError("l2.send(): write failed: " + std::string(strerror(errno)), 0);
-
+            if (sent < 0) sysError(fn + "(): write failed");
             return Value(static_cast<int64_t>(sent));
         }));
 
-    // l2.recv(handle, maxBytes?) -> frame data or nil
+    // l2.recv(handle, maxBytes?) -> frame data, or nil on timeout or when
+    // cancelled. Waits in short slices, so close() from another task,
+    // cancellation and Ctrl+C all end the wait
     module->entries["recv"] = Value(makeNative("l2.recv", -1,
         [](const std::vector<Value>& args) -> Value {
-            if (args.empty() || !args[0].isInt())
-                throw RuntimeError("l2.recv() requires socket handle", 0);
-
-            auto it = sockets.find(args[0].asInt());
-            if (it == sockets.end())
-                throw RuntimeError("l2.recv(): invalid handle", 0);
-
-            auto& sock = it->second;
-
-#ifdef __linux__
-            int maxBytes = 65536;
-            if (args.size() > 1 && args[1].isInt())
-                maxBytes = static_cast<int>(args[1].asInt());
-
-            std::vector<uint8_t> buf(maxBytes);
-            ssize_t n = recv(sock.fd, buf.data(), buf.size(), 0);
-            if (n <= 0) return Value();
-
-            return Value(std::string(reinterpret_cast<char*>(buf.data()), n));
-#elif defined(__APPLE__)
-            std::vector<uint8_t> buf(sock.bpfBufLen);
-            ssize_t n = read(sock.fd, buf.data(), buf.size());
-            if (n <= 0) return Value();
-
-            // Parse BPF header to extract the first packet
-            if (n >= static_cast<ssize_t>(sizeof(struct bpf_hdr))) {
-                auto* hdr = reinterpret_cast<struct bpf_hdr*>(buf.data());
-                uint32_t caplen = hdr->bh_caplen;
-                uint32_t hdrlen = hdr->bh_hdrlen;
-                if (hdrlen + caplen <= static_cast<uint32_t>(n)) {
-                    return Value(std::string(
-                        reinterpret_cast<char*>(buf.data() + hdrlen), caplen));
-                }
+            const std::string fn = "l2.recv";
+            praia::requireArityRange(args, 1, 2, fn);
+            auto* s = argSocket(args, 0, fn);
+            int64_t maxBytes = 65536;
+            if (args.size() > 1 && !args[1].isNil()) {
+                maxBytes = praia::requireInt(args, 1, fn);
+                if (maxBytes < 1 || maxBytes > 65536)
+                    praia::error(fn + "(): maxBytes must be between 1 and 65536");
             }
-            return Value();
+
+            std::unique_lock<std::timed_mutex> r(s->recvMu, std::defer_lock);
+            if (!acquire(r, s, fn)) return Value();
+
+            std::string frame;
+#ifdef __APPLE__
+            if (nextBpfFrame(s, frame)) {
+                if (frame.size() > static_cast<size_t>(maxBytes)) frame.resize(maxBytes);
+                return Value(frame);
+            }
 #endif
+            const int timeoutMs = s->timeoutMs;
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(timeoutMs);
+            while (true) {
+                if (interrupted()) praia::error("Interrupted");
+                if (cancelled() || s->closing) return Value();
+                int slice = 100;
+                if (timeoutMs > 0) {
+                    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (left <= 0) return Value();   // timeout
+                    slice = static_cast<int>(std::min<long long>(left, 100));
+                }
+                struct pollfd pfd = {s->fd, POLLIN, 0};
+                int ready = ::poll(&pfd, 1, slice);
+                if (ready < 0 && errno != EINTR) sysError(fn + "()");
+                if (ready <= 0) continue;
+                if (pfd.revents & (POLLERR | POLLNVAL))
+                    praia::error(fn + "(): the socket reported an error");
+#ifdef __linux__
+                frame.resize(static_cast<size_t>(maxBytes));
+                ssize_t n = ::recv(s->fd, frame.data(), frame.size(), MSG_DONTWAIT);
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+                    sysError(fn + "()");
+                }
+                frame.resize(static_cast<size_t>(n));
+                return Value(frame);
+#elif defined(__APPLE__)
+                ssize_t n = ::read(s->fd, s->bpfBuf.data(), s->bpfBuf.size());
+                if (n < 0) {
+                    if (errno == EAGAIN || errno == EINTR) continue;
+                    sysError(fn + "()");
+                }
+                s->bpfOff = 0;
+                s->bpfLen = static_cast<size_t>(n);
+                if (nextBpfFrame(s, frame)) {
+                    if (frame.size() > static_cast<size_t>(maxBytes)) frame.resize(maxBytes);
+                    return Value(frame);
+                }
+#endif
+            }
         }));
 
-    // l2.close(handle)
+    // l2.close(handle). Closing twice is fine
     module->entries["close"] = Value(makeNative("l2.close", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("l2.close() requires socket handle", 0);
-
-            auto it = sockets.find(args[0].asInt());
-            if (it == sockets.end()) return Value();
-
-            if (it->second.fd >= 0)
-                ::close(it->second.fd);
-            sockets.erase(it);
+            auto* s = argSocket(args, 0, "l2.close");
+            // A recv() waiting in another task sees this within one slice
+            s->closing = true;
+            std::lock_guard<std::timed_mutex> r(s->recvMu);
+            std::lock_guard<std::timed_mutex> w(s->sendMu);
+            closeFd(s);
             return Value();
         }));
 
     // l2.mac(interface) -> "aa:bb:cc:dd:ee:ff"
     module->entries["mac"] = Value(makeNative("l2.mac", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isString())
-                throw RuntimeError("l2.mac() requires interface name", 0);
-
+            const std::string fn = "l2.mac";
+            const auto& ifName = praia::requireString(args, 0, fn);
             uint8_t mac[6];
-            if (!getIfaceMac(args[0].asString(), mac))
-                throw RuntimeError("l2.mac(): could not get MAC for " + args[0].asString(), 0);
+            if (!getIfaceMac(ifName, mac))
+                praia::error(fn + "(): could not get MAC for " + ifName);
 
             char buf[18];
             snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -262,28 +398,17 @@ extern "C" void praia_register(PraiaMap* module) {
             return Value(std::string(buf));
         }));
 
-    // l2.setTimeout(handle, ms)
+    // l2.setTimeout(handle, ms): how long recv() waits; 0 waits until a
+    // frame arrives (or close, cancellation or Ctrl+C)
     module->entries["setTimeout"] = Value(makeNative("l2.setTimeout", 2,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("l2.setTimeout() requires socket handle", 0);
-            if (!args[1].isInt())
-                throw RuntimeError("l2.setTimeout() requires timeout in ms", 0);
-
-            auto it = sockets.find(args[0].asInt());
-            if (it == sockets.end())
-                throw RuntimeError("l2.setTimeout(): invalid handle", 0);
-
-            int ms = static_cast<int>(args[1].asInt());
-            struct timeval tv;
-            tv.tv_sec = ms / 1000;
-            tv.tv_usec = (ms % 1000) * 1000;
-
-#ifdef __linux__
-            setsockopt(it->second.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-#elif defined(__APPLE__)
-            ioctl(it->second.fd, BIOCSRTIMEOUT, &tv);
-#endif
+            const std::string fn = "l2.setTimeout";
+            auto* s = argSocket(args, 0, fn);
+            int64_t ms = praia::requireInt(args, 1, fn);
+            if (ms < 0 || ms > 3600000)
+                praia::error(fn + "(): timeout must be between 0 and 3600000 ms");
+            if (s->closing) praia::error(fn + "(): the socket is closed");
+            s->timeoutMs = static_cast<int>(ms);
             return Value();
         }));
 }
