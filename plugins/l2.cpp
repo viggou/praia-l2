@@ -119,6 +119,11 @@ static L2Socket* argSocket(const std::vector<Value>& args, size_t i, const std::
     return praia::getExternal<L2Socket>(args[i], kSocketType);
 }
 
+// Ctrl+C is pending. Calls then return nil promptly and leave the bit
+// set: the engine takes it at its next yield point, once, and throws
+// "Interrupted" or runs the script's SIGINT handler. Throwing here
+// instead (without consuming the bit) interrupted again in the catch
+// block, the next call and the engine's next check
 static bool interrupted() {
     return g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT);
 }
@@ -136,8 +141,8 @@ static int sliceUntil(Clock::time_point deadline, int cap) {
     return static_cast<int>(std::max<long long>(0, std::min<long long>(left, cap)));
 }
 
-// Takes `lock` in short waits, giving up (false) if the call is cancelled
-// or the deadline (if any) passes meanwhile. Ctrl+C throws. A socket
+// Takes `lock` in short waits, giving up (false) if the call is cancelled,
+// Ctrl+C is pending, or the deadline (if any) passes meanwhile. A socket
 // already closed throws; one closed while waiting throws too, unless
 // closedIsNil (recv, which returns nil when closed while it waits)
 static bool acquire(std::unique_lock<std::timed_mutex>& lock, L2Socket* s,
@@ -145,7 +150,7 @@ static bool acquire(std::unique_lock<std::timed_mutex>& lock, L2Socket* s,
                     bool closedIsNil = false) {
     if (s->closing) praia::error(fn + "(): the socket is closed");
     while (true) {
-        if (interrupted()) praia::error("Interrupted");
+        if (interrupted()) return false;
         if (s->closing) {
             if (closedIsNil) return false;
             praia::error(fn + "(): the socket is closed");
@@ -328,9 +333,12 @@ extern "C" void praia_register(PraiaMap* module) {
             // Never blocks while holding sendMu: a full queue (EAGAIN or
             // ENOBUFS, after which nothing was sent) is waited out in short
             // slices, so close(), cancellation and Ctrl+C still get
-            // through. A frame goes out whole or not at all, so retrying
-            // can't send it twice
+            // through. They're checked before every attempt, so a send
+            // ended by one transmits nothing. A frame goes out whole or not
+            // at all, so retrying can't send it twice
             while (true) {
+                if (interrupted() || cancelled()) return Value();
+                if (s->closing) praia::error(fn + "(): the socket is closed");
 #ifdef __linux__
                 ssize_t sent = sendto(s->fd, data.data(), data.size(), MSG_DONTWAIT,
                                       (struct sockaddr*)&sll, sizeof(sll));
@@ -343,9 +351,6 @@ extern "C" void praia_register(PraiaMap* module) {
                     errno = err;
                     sysError(fn + "(): write failed");
                 }
-                if (interrupted()) praia::error("Interrupted");
-                if (s->closing) praia::error(fn + "(): the socket is closed");
-                if (cancelled()) return Value();
                 if (err == ENOBUFS) {
                     // The driver queue is full, which the fd may not show
                     // by polling unwritable: just give it a moment
@@ -386,8 +391,7 @@ extern "C" void praia_register(PraiaMap* module) {
             }
 #endif
             while (true) {
-                if (interrupted()) praia::error("Interrupted");
-                if (cancelled() || s->closing) return Value();
+                if (interrupted() || cancelled() || s->closing) return Value();
                 int slice = 100;
                 if (timeoutMs > 0) {
                     if (Clock::now() >= deadline) return Value();   // timeout
@@ -397,6 +401,9 @@ extern "C" void praia_register(PraiaMap* module) {
                 int ready = ::poll(&pfd, 1, slice);
                 if (ready < 0 && errno != EINTR) sysError(fn + "()");
                 if (ready <= 0) continue;
+                // Whatever arrived during the wait, these end the call
+                // without reading it
+                if (interrupted() || cancelled() || s->closing) return Value();
                 if (pfd.revents & (POLLERR | POLLNVAL))
                     praia::error(fn + "(): the socket reported an error");
 #ifdef __linux__

@@ -43,8 +43,8 @@ l2.close(sock)
 | Function | Description |
 |----------|-------------|
 | `open(iface)` | Open a raw L2 socket bound to an interface. Returns a socket handle, closed automatically once it's no longer used |
-| `send(sock, data)` | Send a raw ethernet frame (14 to 65535 bytes). If the interface's queue is full it waits for room; `close`, cancellation (returns nil) and Ctrl+C end the wait |
-| `recv(sock, maxBytes?)` | Receive a raw ethernet frame (up to `maxBytes`, 1-65536, default 65536). Returns nil on timeout, or when cancelled with `withCancel`. Ctrl+C throws |
+| `send(sock, data)` | Send a raw ethernet frame (14 to 65535 bytes). If the interface's queue is full it waits for room; `close` (throws), cancellation and Ctrl+C (return nil, sending nothing) end the wait |
+| `recv(sock, maxBytes?)` | Receive a raw ethernet frame (up to `maxBytes`, 1-65536, default 65536). Returns nil on timeout, when cancelled with `withCancel`, or on Ctrl+C, which the script then sees once as usual (`Interrupted`, or its `sys.onSignal` handler) |
 | `close(sock)` | Close the socket. A `recv` waiting in another task returns nil. Closing twice is fine |
 | `setTimeout(sock, ms)` | How long `recv` waits, in milliseconds, including any wait for another task's `recv` on the same socket; 0 (the default) waits until a frame arrives |
 | `mac(iface)` | Get the MAC address of a local interface |
