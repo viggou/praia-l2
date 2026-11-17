@@ -19,7 +19,7 @@
 #include <vector>
 
 PRAIA_DECLARE_ABI();
-PRAIA_PLUGIN_METADATA("l2", "1.1.1",
+PRAIA_PLUGIN_METADATA("l2", "1.2.0",
                      "Raw L2 (Ethernet) socket access");
 
 #ifdef __linux__
