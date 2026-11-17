@@ -7,8 +7,10 @@
 #include "signal_state.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <csignal>
 #include <cstring>
 #include <mutex>
@@ -126,16 +128,36 @@ static bool cancelled() {
     return c && *c;
 }
 
+using Clock = std::chrono::steady_clock;
+
+// Milliseconds left until deadline, rounded up, at most cap
+static int sliceUntil(Clock::time_point deadline, int cap) {
+    auto left = std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now()).count();
+    return static_cast<int>(std::max<long long>(0, std::min<long long>(left, cap)));
+}
+
 // Takes `lock` in short waits, giving up (false) if the call is cancelled
-// or the socket closes meanwhile. Ctrl+C throws
+// or the deadline (if any) passes meanwhile. Ctrl+C throws. A socket
+// already closed throws; one closed while waiting throws too, unless
+// closedIsNil (recv, which returns nil when closed while it waits)
 static bool acquire(std::unique_lock<std::timed_mutex>& lock, L2Socket* s,
-                    const std::string& fn) {
+                    const std::string& fn, const Clock::time_point* deadline = nullptr,
+                    bool closedIsNil = false) {
+    if (s->closing) praia::error(fn + "(): the socket is closed");
     while (true) {
         if (interrupted()) praia::error("Interrupted");
-        if (s->closing) praia::error(fn + "(): the socket is closed");
+        if (s->closing) {
+            if (closedIsNil) return false;
+            praia::error(fn + "(): the socket is closed");
+        }
         if (cancelled()) return false;
         if (lock.owns_lock()) return true;
-        if (lock.try_lock_for(std::chrono::milliseconds(50)))
+        int wait = 50;
+        if (deadline) {
+            if (Clock::now() >= *deadline) return false;
+            wait = std::max(1, sliceUntil(*deadline, 50));
+        }
+        if (lock.try_lock_for(std::chrono::milliseconds(wait)))
             continue;   // held: check once more
     }
 }
@@ -143,12 +165,17 @@ static bool acquire(std::unique_lock<std::timed_mutex>& lock, L2Socket* s,
 #ifdef __APPLE__
 // The next frame left in the BPF buffer, or false if none is
 static bool nextBpfFrame(L2Socket* s, std::string& frame) {
+    // The header as the kernel writes it ends at bh_hdrlen: 18 bytes, while
+    // sizeof(struct bpf_hdr) adds padding to 20. bh_hdrlen itself is
+    // often 18 (for Ethernet, so the frame's IP header lands aligned)
+    const size_t kHdrMin = offsetof(struct bpf_hdr, bh_hdrlen) +
+                           sizeof(((struct bpf_hdr*)nullptr)->bh_hdrlen);
     while (s->bpfOff < s->bpfLen) {
         size_t left = s->bpfLen - s->bpfOff;
-        if (left < sizeof(struct bpf_hdr)) break;
+        if (left < kHdrMin) break;
         auto* hdr = reinterpret_cast<const struct bpf_hdr*>(s->bpfBuf.data() + s->bpfOff);
         size_t total = static_cast<size_t>(hdr->bh_hdrlen) + hdr->bh_caplen;
-        if (hdr->bh_hdrlen < sizeof(struct bpf_hdr) || total > left) break;
+        if (hdr->bh_hdrlen < kHdrMin || total > left) break;
         frame.assign(reinterpret_cast<const char*>(s->bpfBuf.data() + s->bpfOff + hdr->bh_hdrlen),
                      hdr->bh_caplen);
         s->bpfOff += BPF_WORDALIGN(total);
@@ -345,8 +372,11 @@ extern "C" void praia_register(PraiaMap* module) {
                     praia::error(fn + "(): maxBytes must be between 1 and 65536");
             }
 
+            // The timeout covers waiting for another task's recv() too
+            const int timeoutMs = s->timeoutMs;
+            const auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
             std::unique_lock<std::timed_mutex> r(s->recvMu, std::defer_lock);
-            if (!acquire(r, s, fn)) return Value();
+            if (!acquire(r, s, fn, timeoutMs > 0 ? &deadline : nullptr, true)) return Value();
 
             std::string frame;
 #ifdef __APPLE__
@@ -355,18 +385,13 @@ extern "C" void praia_register(PraiaMap* module) {
                 return Value(frame);
             }
 #endif
-            const int timeoutMs = s->timeoutMs;
-            auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(timeoutMs);
             while (true) {
                 if (interrupted()) praia::error("Interrupted");
                 if (cancelled() || s->closing) return Value();
                 int slice = 100;
                 if (timeoutMs > 0) {
-                    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        deadline - std::chrono::steady_clock::now()).count();
-                    if (left <= 0) return Value();   // timeout
-                    slice = static_cast<int>(std::min<long long>(left, 100));
+                    if (Clock::now() >= deadline) return Value();   // timeout
+                    slice = sliceUntil(deadline, 100);              // rounded up
                 }
                 struct pollfd pfd = {s->fd, POLLIN, 0};
                 int ready = ::poll(&pfd, 1, slice);

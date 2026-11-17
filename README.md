@@ -46,7 +46,7 @@ l2.close(sock)
 | `send(sock, data)` | Send a raw ethernet frame (14 to 65535 bytes). If the interface's queue is full it waits for room; `close`, cancellation (returns nil) and Ctrl+C end the wait |
 | `recv(sock, maxBytes?)` | Receive a raw ethernet frame (up to `maxBytes`, 1-65536, default 65536). Returns nil on timeout, or when cancelled with `withCancel`. Ctrl+C throws |
 | `close(sock)` | Close the socket. A `recv` waiting in another task returns nil. Closing twice is fine |
-| `setTimeout(sock, ms)` | How long `recv` waits, in milliseconds; 0 (the default) waits until a frame arrives |
+| `setTimeout(sock, ms)` | How long `recv` waits, in milliseconds, including any wait for another task's `recv` on the same socket; 0 (the default) waits until a frame arrives |
 | `mac(iface)` | Get the MAC address of a local interface |
 
 ### Frame building
