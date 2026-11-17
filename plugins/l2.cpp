@@ -258,6 +258,10 @@ extern "C" void praia_register(PraiaMap* module) {
             if (ioctl(fd, BIOCIMMEDIATE, &one) < 0) fail("BIOCIMMEDIATE");
             // Send source MACs as given instead of the interface's
             if (ioctl(fd, BIOCSHDRCMPLT, &one) < 0) fail("BIOCSHDRCMPLT");
+            // recv() only reads after poll says so; non-blocking makes sure
+            // a read after a spurious wakeup can't block
+            int flags = fcntl(fd, F_GETFL);
+            if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) fail("O_NONBLOCK");
             bpfBuf.resize(bufLen);
 #endif
 
@@ -293,13 +297,37 @@ extern "C" void praia_register(PraiaMap* module) {
             sll.sll_ifindex = s->ifIndex;
             sll.sll_halen = 6;
             memcpy(sll.sll_addr, data.data(), 6);
-            ssize_t sent = sendto(s->fd, data.data(), data.size(), 0,
-                                  (struct sockaddr*)&sll, sizeof(sll));
-#elif defined(__APPLE__)
-            ssize_t sent = write(s->fd, data.data(), data.size());
 #endif
-            if (sent < 0) sysError(fn + "(): write failed");
-            return Value(static_cast<int64_t>(sent));
+            // Never blocks while holding sendMu: a full queue (EAGAIN or
+            // ENOBUFS, after which nothing was sent) is waited out in short
+            // slices, so close(), cancellation and Ctrl+C still get
+            // through. A frame goes out whole or not at all, so retrying
+            // can't send it twice
+            while (true) {
+#ifdef __linux__
+                ssize_t sent = sendto(s->fd, data.data(), data.size(), MSG_DONTWAIT,
+                                      (struct sockaddr*)&sll, sizeof(sll));
+#elif defined(__APPLE__)
+                ssize_t sent = write(s->fd, data.data(), data.size());
+#endif
+                if (sent >= 0) return Value(static_cast<int64_t>(sent));
+                int err = errno;
+                if (err != EAGAIN && err != EWOULDBLOCK && err != ENOBUFS && err != EINTR) {
+                    errno = err;
+                    sysError(fn + "(): write failed");
+                }
+                if (interrupted()) praia::error("Interrupted");
+                if (s->closing) praia::error(fn + "(): the socket is closed");
+                if (cancelled()) return Value();
+                if (err == ENOBUFS) {
+                    // The driver queue is full, which the fd may not show
+                    // by polling unwritable: just give it a moment
+                    ::usleep(10000);
+                } else {
+                    struct pollfd pfd = {s->fd, POLLOUT, 0};
+                    ::poll(&pfd, 1, 100);
+                }
+            }
         }));
 
     // l2.recv(handle, maxBytes?) -> frame data, or nil on timeout or when
