@@ -85,4 +85,4 @@ Requires Praia's development headers (`praia --include-path`).
 - **Linux**: Uses `AF_PACKET` with `SOCK_RAW`. Requires root or `CAP_NET_RAW`.
 - **macOS**: Uses BPF (`/dev/bpfN`). Requires root (or access to the BPF devices). One BPF read can hold several frames; `recv()` returns them one per call.
 
-Async tasks can share a socket: a `send` doesn't wait for a `recv` in progress, and `close` from one task ends a `recv` waiting in another.
+Async tasks can share a socket: a `send` doesn't wait for a `recv` in progress, and `close` from one task ends a `recv` waiting in another. Ctrl+C is delivered once, to whichever task's engine notices it first (as for Praia's own `net` calls): a `recv` or `send` waiting in another task keeps waiting until its timeout, a `close`, or cancellation. If the script ends from the Ctrl+C, its sockets are closed and those calls return.
