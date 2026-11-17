@@ -55,6 +55,10 @@ struct L2Socket {
     std::timed_mutex recvMu;
     std::timed_mutex sendMu;
     std::atomic<bool> closing{false};
+    // close() wants the fd closed. Whoever holds sendMu when they see it,
+    // close() itself or a send finishing, takes it (by exchange) and
+    // closes: see close()
+    std::atomic<bool> closePending{false};
     int fd = -1;
     int ifIndex = 0;
     // How long recv() waits; 0: until a frame arrives. Atomic, so
@@ -73,7 +77,8 @@ static const char* kSocketType = "l2.socket";
 static std::mutex g_regMu;
 static auto* g_sockets = new std::unordered_set<L2Socket*>();
 
-// Closes the fd. Call with both locks held
+// Closes the fd. Call with both locks held, or (close()) with sendMu
+// held once closing is set and recvMu has been passed through
 static void closeFd(L2Socket* s) {
     if (s->fd >= 0) ::close(s->fd);
     s->fd = -1;
@@ -322,6 +327,14 @@ extern "C" void praia_register(PraiaMap* module) {
 
             std::unique_lock<std::timed_mutex> w(s->sendMu, std::defer_lock);
             if (!acquire(w, s, fn)) return Value();
+            // However this send ends, if close() gave up waiting for it,
+            // the fd is closed here, now that no write is using it
+            struct CloseIfPending {
+                L2Socket* s;
+                ~CloseIfPending() {
+                    if (s->closePending.exchange(false)) closeFd(s);
+                }
+            } closeIfPending{s};
 #ifdef __linux__
             struct sockaddr_ll sll;
             memset(&sll, 0, sizeof(sll));
@@ -435,11 +448,24 @@ extern "C" void praia_register(PraiaMap* module) {
     module->entries["close"] = Value(makeNative("l2.close", 1,
         [](const std::vector<Value>& args) -> Value {
             auto* s = argSocket(args, 0, "l2.close");
-            // A recv() waiting in another task sees this within one slice
+            // A recv() waiting in another task sees this within one slice,
+            // and no new call starts
             s->closing = true;
-            std::lock_guard<std::timed_mutex> r(s->recvMu);
-            std::lock_guard<std::timed_mutex> w(s->sendMu);
-            closeFd(s);
+            // A barrier: once close() has held recvMu, any recv() that was
+            // running has returned, and every later one sees closing before
+            // touching the fd. So the fd can be closed without recvMu, and
+            // close() never holds it while waiting for sendMu
+            { std::lock_guard<std::timed_mutex> r(s->recvMu); }
+            // A send can be stuck in the kernel: on macOS a BPF write waits
+            // without limit for packet buffers when the system is out of
+            // them, and nothing interrupts that. So close() doesn't wait for
+            // it: it marks the close pending, then closes the fd only if it
+            // gets sendMu soon. Otherwise the send closes it as it returns,
+            // so the fd is never closed (and its number reused) under a write.
+            // Set before trying the lock, so a send finishing meanwhile sees it
+            s->closePending = true;
+            std::unique_lock<std::timed_mutex> w(s->sendMu, std::chrono::milliseconds(250));
+            if (w.owns_lock() && s->closePending.exchange(false)) closeFd(s);
             return Value();
         }));
 
